@@ -30,6 +30,8 @@ NAV_TIMEOUT_MS = int(os.getenv("NAV_TIMEOUT_MS", "90000"))
 
 
 def require(name: str, value: str) -> str:
+    # RuntimeError (et pas SystemExit) → capté par le try/except de __main__ et
+    # loggé avec un message clair (sinon l'erreur passe inaperçue sur Railway).
     if not value:
-        raise SystemExit(f"Variable d'environnement manquante : {name}")
+        raise RuntimeError(f"Variable d'environnement manquante : {name}")
     return value

@@ -7,6 +7,7 @@ TikTok change et que le dépôt d'origine corrige la lib, un simple sync du fork
 suffit — la logique métier PayLive (ce fichier) reste inchangée.
 """
 
+import logging
 import re
 from datetime import datetime, timezone
 
@@ -15,6 +16,8 @@ from TikTokApi import TikTokApi
 from . import config
 from .browserless import browser_context_factory, close_browserless
 from . import worker_client
+
+log = logging.getLogger("paylive")
 
 # Même pattern que le worker (cartCreator.ts / tiktokCommentCart.ts).
 PAYLIVE_REGEX = re.compile(r"^\s*pl\s+(\S+)", re.IGNORECASE)
@@ -45,14 +48,21 @@ async def _scrape_store(api: TikTokApi, handle: str) -> list[dict]:
         user = api.user(handle)
         videos = [v async for v in user.videos(count=config.VIDEOS_SCAN)]
     except Exception as e:  # boutique inaccessible / bloquée → on continue
-        print(f"[paylive] @{handle} : vidéos KO ({e})")
+        log.warning("@%s : récupération des vidéos KO (%s)", handle, e)
         return orders
 
     tagged = [v for v in videos if _video_has_hashtag(v, config.PAYLIVE_HASHTAG)]
     tagged.sort(key=lambda v: getattr(v, "create_time", None) or 0, reverse=True)
     tagged = tagged[: config.RECENT_VIDEOS]
-    print(f"[paylive] @{handle} : {len(tagged)} vidéo(s) #{config.PAYLIVE_HASHTAG}")
+    log.info(
+        "@%s : %d vidéo(s) récupérée(s), %d avec #%s",
+        handle,
+        len(videos),
+        len(tagged),
+        config.PAYLIVE_HASHTAG,
+    )
 
+    store_orders = 0
     for v in tagged:
         post_url = f"https://www.tiktok.com/@{handle}/video/{v.id}"
         try:
@@ -72,6 +82,10 @@ async def _scrape_store(api: TikTokApi, handle: str) -> list[dict]:
                     if isinstance(ts, (int, float)) and ts
                     else None
                 )
+                store_orders += 1
+                log.info(
+                    "  commande: ref=%s par @%s sur %s", m.group(1), uid, post_url
+                )
                 orders.append(
                     {
                         "storeTiktokUsername": handle,
@@ -86,21 +100,52 @@ async def _scrape_store(api: TikTokApi, handle: str) -> list[dict]:
                     }
                 )
         except Exception as e:
-            print(f"[paylive] commentaires KO (video {v.id}) : {e}")
+            log.warning("  commentaires KO (video %s) : %s", v.id, e)
+    log.info("@%s : %d commande(s) détectée(s)", handle, store_orders)
     return orders
 
 
+def _log_startup() -> None:
+    log.info("=== Scraper PayLive — démarrage ===")
+    log.info("WORKER_URL = %s", config.WORKER_URL or "(ABSENT)")
+    log.info(
+        "WORKER_INTERNAL_SECRET = %s",
+        "défini" if config.WORKER_INTERNAL_SECRET else "(ABSENT)",
+    )
+    log.info(
+        "BROWSERLESS_WS = %s",
+        "défini" if (config.BROWSERLESS_WS or config.BROWSERLESS_TOKEN) else "(ABSENT)",
+    )
+    log.info("MS_TOKENS = %d token(s)", len(config.MS_TOKENS))
+
+
 async def scrape() -> None:
+    _log_startup()
+    # Vérif des env critiques AVANT tout appel réseau (message clair sinon).
+    missing = [
+        n
+        for n, v in (
+            ("WORKER_URL", config.WORKER_URL),
+            ("WORKER_INTERNAL_SECRET", config.WORKER_INTERNAL_SECRET),
+            ("MS_TOKENS", config.MS_TOKENS),
+            ("BROWSERLESS_WS/TOKEN", config.BROWSERLESS_WS or config.BROWSERLESS_TOKEN),
+        )
+        if not v
+    ]
+    if missing:
+        raise RuntimeError(f"Variables d'environnement manquantes : {missing}")
+
+    log.info("Récupération des boutiques auprès du worker…")
     handles = worker_client.fetch_targets()
-    print(f"[paylive] {len(handles)} boutique(s) à scraper")
+    log.info("%d boutique(s) à scraper : %s", len(handles), handles)
     if not handles:
+        log.info("Aucune boutique à scraper — fin.")
         return
-    if not config.MS_TOKENS:
-        raise SystemExit("MS_TOKENS manquant")
 
     all_orders: list[dict] = []
     try:
         async with TikTokApi() as api:
+            log.info("Création de la session TikTokApi (Browserless)…")
             await api.create_sessions(
                 num_sessions=1,
                 ms_tokens=config.MS_TOKENS,
@@ -109,16 +154,20 @@ async def scrape() -> None:
                 timeout=config.NAV_TIMEOUT_MS,
                 suppress_resource_load_types=_SUPPRESS,
             )
-            print("[paylive] Session TikTokApi prête (Browserless)")
+            log.info("Session TikTokApi prête.")
             for handle in handles:
                 all_orders.extend(await _scrape_store(api, handle))
     finally:
         await close_browserless()
 
-    print(f"[paylive] {len(all_orders)} commande(s) détectée(s)")
+    log.info("Total : %d commande(s) détectée(s)", len(all_orders))
     if all_orders:
+        log.info("Envoi au worker…")
         res = worker_client.post_orders(all_orders)
-        print(
-            f"[paylive] Worker : {res.get('created', 0)} créé(s), "
-            f"{res.get('skipped', 0)} ignoré(s)"
+        log.info(
+            "Worker : %s créé(s), %s ignoré(s)",
+            res.get("created", 0),
+            res.get("skipped", 0),
         )
+    else:
+        log.info("Rien à envoyer au worker.")

@@ -21,7 +21,7 @@ python -m paylive
 
 ## Déploiement Railway (projet séparé, déjà créé)
 - **Start command** : `python -m paylive`
-- **Cron Schedule** : `0 0 * * *`  → ~02:00 Paris (heure d'été, UTC+2). Ajuster selon DST.
-  (Railway exécute le cron en **UTC** : 2h Paris = 0h UTC l'été, 1h UTC l'hiver.)
+- **Cron Schedule** : `0 2 * * *`  → ~04:00 Paris (heure d'été, UTC+2).
+  (Railway exécute le cron en **UTC** : 4h Paris = 2h UTC l'été, 3h UTC l'hiver → `0 3 * * *`.)
 - Variables d'env : cf. `paylive/.env.example`.
 - Pas besoin de `playwright install` (navigateur distant Browserless).
