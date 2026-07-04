@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from TikTokApi import TikTokApi
 
 from . import config
+from . import browserless_keys
 from .browserless import browser_context_factory, close_browserless
 from . import worker_client
 
@@ -113,36 +114,24 @@ def _log_startup() -> None:
         "défini" if config.WORKER_INTERNAL_SECRET else "(ABSENT)",
     )
     log.info(
-        "BROWSERLESS_WS = %s",
-        "défini" if (config.BROWSERLESS_WS or config.BROWSERLESS_TOKEN) else "(ABSENT)",
+        "BROWSERLESS = %s (rotation : %d token(s) ; seuil %d/%d)",
+        "défini"
+        if (
+            config.BROWSERLESS_TOKENS
+            or config.BROWSERLESS_WS
+            or config.BROWSERLESS_TOKEN
+        )
+        else "(ABSENT)",
+        len(config.BROWSERLESS_TOKENS),
+        config.BROWSERLESS_USAGE_THRESHOLD,
+        config.BROWSERLESS_USAGE_LIMIT,
     )
     log.info("MS_TOKENS = %d token(s)", len(config.MS_TOKENS))
 
 
-async def scrape() -> None:
-    _log_startup()
-    # Vérif des env critiques AVANT tout appel réseau (message clair sinon).
-    missing = [
-        n
-        for n, v in (
-            ("WORKER_URL", config.WORKER_URL),
-            ("WORKER_INTERNAL_SECRET", config.WORKER_INTERNAL_SECRET),
-            ("MS_TOKENS", config.MS_TOKENS),
-            ("BROWSERLESS_WS/TOKEN", config.BROWSERLESS_WS or config.BROWSERLESS_TOKEN),
-        )
-        if not v
-    ]
-    if missing:
-        raise RuntimeError(f"Variables d'environnement manquantes : {missing}")
-
-    log.info("Récupération des boutiques auprès du worker…")
-    handles = worker_client.fetch_targets()
-    log.info("%d boutique(s) à scraper : %s", len(handles), handles)
-    if not handles:
-        log.info("Aucune boutique à scraper — fin.")
-        return
-
-    all_orders: list[dict] = []
+async def _run_session(handles: list[str]) -> list[dict]:
+    """Ouvre UNE session Browserless et scrape toutes les boutiques (1 tentative)."""
+    orders: list[dict] = []
     try:
         async with TikTokApi() as api:
             log.info("Création de la session TikTokApi (Browserless)…")
@@ -156,9 +145,61 @@ async def scrape() -> None:
             )
             log.info("Session TikTokApi prête.")
             for handle in handles:
-                all_orders.extend(await _scrape_store(api, handle))
+                orders.extend(await _scrape_store(api, handle))
     finally:
         await close_browserless()
+    return orders
+
+
+async def scrape() -> None:
+    _log_startup()
+    # Vérif des env critiques AVANT tout appel réseau (message clair sinon).
+    missing = [
+        n
+        for n, v in (
+            ("WORKER_URL", config.WORKER_URL),
+            ("WORKER_INTERNAL_SECRET", config.WORKER_INTERNAL_SECRET),
+            ("MS_TOKENS", config.MS_TOKENS),
+            (
+                "BROWSERLESS_TOKENS/WS/TOKEN",
+                config.BROWSERLESS_TOKENS
+                or config.BROWSERLESS_WS
+                or config.BROWSERLESS_TOKEN,
+            ),
+        )
+        if not v
+    ]
+    if missing:
+        raise RuntimeError(f"Variables d'environnement manquantes : {missing}")
+
+    log.info("Récupération des boutiques auprès du worker…")
+    handles = worker_client.fetch_targets()
+    log.info("%d boutique(s) à scraper : %s", len(handles), handles)
+    if not handles:
+        log.info("Aucune boutique à scraper — fin.")
+        return
+
+    # Filet de sécurité : un token peut passer le seuil (ex. 850/1000) mais le run
+    # consomme plus que le restant → 401 « usage limit » en pleine connexion. On
+    # écarte alors ce token et on RELANCE le scrape avec le suivant.
+    max_attempts = max(1, len(config.BROWSERLESS_TOKENS))
+    all_orders: list[dict] = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            all_orders = await _run_session(handles)
+            break
+        except Exception as e:
+            if browserless_keys.is_usage_limit_error(e) and attempt < max_attempts:
+                browserless_keys.mark_current_exhausted()
+                log.warning(
+                    "[browserless] quota épuisé pendant le run (%s) — "
+                    "nouvelle tentative %d/%d avec le token suivant",
+                    str(e).splitlines()[0] if str(e) else e,
+                    attempt + 1,
+                    max_attempts,
+                )
+                continue
+            raise
 
     log.info("Total : %d commande(s) détectée(s)", len(all_orders))
     if all_orders:

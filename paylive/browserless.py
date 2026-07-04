@@ -13,19 +13,38 @@ from urllib.parse import quote
 from playwright.async_api import Playwright, BrowserContext
 
 from . import config
+from . import browserless_keys
 
 _browser = None  # référence pour fermer la connexion CDP en fin de run
 
 
-def build_ws() -> str:
-    if config.BROWSERLESS_WS:
-        return config.BROWSERLESS_WS
-    token = config.require("BROWSERLESS_TOKEN", config.BROWSERLESS_TOKEN)
+def _ws_from_token(token: str) -> str:
     # Endpoint CDP de BASE (pas /chrome/playwright ni /stealth).
     return (
         f"wss://production-sfo.browserless.io?token={quote(token)}"
         f"&proxy=residential&proxyCountry={config.PROXY_COUNTRY}&proxySticky=true"
     )
+
+
+def build_ws() -> str:
+    # 1) Rotation : 1er token sous le seuil de conso mensuelle (fill-first).
+    token = browserless_keys.select_token()
+    if token:
+        return _ws_from_token(token)
+    # Si des tokens sont configurés mais qu'aucun n'est disponible (tous saturés
+    # ou écartés en cours de run), on échoue clairement plutôt que de retomber sur
+    # un repli env trompeur.
+    if config.BROWSERLESS_TOKENS:
+        raise RuntimeError(
+            "Tous les tokens Browserless sont saturés ou écartés "
+            "(quota mensuel atteint) — ajouter un token ou attendre le reset."
+        )
+    # 2) Repli env (aucun BROWSERLESS_TOKENS configuré) : URL WS complète…
+    if config.BROWSERLESS_WS:
+        return config.BROWSERLESS_WS
+    # 3) …ou token unique historique.
+    token = config.require("BROWSERLESS_TOKEN", config.BROWSERLESS_TOKEN)
+    return _ws_from_token(token)
 
 
 async def browser_context_factory(p: Playwright) -> BrowserContext:
